@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>3D Gesture Christmas Tree</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+        
+        /* 摄像头画中画 (调试用，可隐藏) */
+        .input_video {
+            position: absolute; top: 10px; right: 10px; width: 160px; height: 120px;
+            z-index: 2; border-radius: 8px; opacity: 0.7; transform: scaleX(-1); display: none;
+        }
+
+        /* 加载与启动界面 */
+        #loading {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: #000; color: #fff; display: flex; flex-direction: column;
+            align-items: center; justify-content: center; z-index: 10;
+        }
+        #start-btn {
+            padding: 15px 30px; font-size: 18px; background: #d42426; color: white;
+            border: none; border-radius: 25px; cursor: pointer; margin-top: 20px;
+        }
+        #status { margin-top: 10px; color: #888; font-size: 12px; }
+        
+        /* 交互提示 */
+        #guide {
+            position: absolute; bottom: 30px; width: 100%; text-align: center;
+            color: rgba(255,255,255,0.6); pointer-events: none; z-index: 3;
+            font-size: 14px;
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tween.js/18.6.4/tween.umd.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <video class="input_video" playsinline webkit-playsinline muted></video>
+
+    <audio id="bgm" loop>
+        <source src="./music.mp3" type="audio/mpeg">
+    </audio>
+
+    <div id="loading">
+        <h1>🎄 3D 圣诞树相册</h1>
+        <p>需要摄像头权限以识别手势</p>
+        <div id="status">正在初始化组件...</div>
+        <button id="start-btn" disabled>点击开始</button>
+    </div>
+
+    <div id="canvas-container"></div>
+    
+    <div id="guide">张开手掌：炸裂 | 握紧拳头：聚合 | 点击照片：放大查看</div>
+
+<script>
+    // ================= 配置区域 =================
+    const imageUrls = [];
+    // 根据你截图中的文件数量，假设你有 20 张左右，如果有更多，修改下面这个数字
+    const photoCount = 90; 
+
+    // 自动生成符合你文件名的路径：image (1).jpeg, image (2).jpeg ...
+    for (let i = 1; i <= photoCount; i++) {
+        // 注意：这里严格匹配了你的文件名格式（包含空格和括号）
+        imageUrls.push(`./image (${i}).jpeg`);
+    }
+
+    // ================= 性能优化工具：图片压缩 =================
+    // 功能：将大图绘制到小 Canvas 上，返回 Base64，减少显存占用
+    function compressImage(url, width = 128) {
+        return new Promise((resolve, reject) => {
+            const img = new Image();
+            img.crossOrigin = "Anonymous"; // 处理跨域
+            img.src = url;
+            img.onload = () => {
+                const canvas = document.createElement('canvas');
+                const scale = width / img.width;
+                canvas.width = width;
+                canvas.height = img.height * scale;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                resolve({
+                    src: canvas.toDataURL('image/jpeg', 0.8), // 返回压缩后的 base64
+                    originalSrc: url, // 保存原图链接用于放大
+                    aspect: img.width / img.height
+                });
+            };
+            img.onerror = (e) => {
+                console.warn("Image load failed", url);
+                resolve(null); // 忽略错误图片
+            };
+        });
+    }
+
+    // ================= Three.js 核心逻辑 =================
+    let scene, camera, renderer;
+    let particles = [];
+    let state = 'tree'; // tree, explode, viewing
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    let currentViewObject = null; // 当前放大查看的对象
+
+    // 初始化 3D 场景
+    async function initThree() {
+        const container = document.getElementById('canvas-container');
+        scene = new THREE.Scene();
+        // 星空背景雾效
+        scene.fog = new THREE.FogExp2(0x000000, 0.0008);
+
+        camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 2000);
+        camera.position.set(0, 100, 400);
+        camera.lookAt(0, 50, 0);
+
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // 限制像素比以优化性能
+        container.appendChild(renderer.domElement);
+
+        // 灯光
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.8);
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.5);
+        dirLight.position.set(0, 200, 100);
+        scene.add(dirLight);
+
+        // 创建粒子系统
+        await createParticles();
+
+        // 交互事件
+        window.addEventListener('resize', onWindowResize, false);
+        window.addEventListener('click', onMouseClick, false);
+        window.addEventListener('touchstart', onTouchStart, false);
+        
+        animate();
+    }
+
+    // 创建照片粒子
+    async function createParticles() {
+        const statusDiv = document.getElementById('status');
+        statusDiv.innerText = "正在压缩并生成照片纹理...";
+        
+        let loadedCount = 0;
+        // 如果图片少，循环使用这些图片填满树
+        const targetParticleCount = 80; 
+        
+        // 螺旋形圣诞树参数
+        const radiusStep = 4; // 半径增长步长
+        const heightStep = 3; // 高度步长
+        const angleStep = 0.4; // 角度步长
+
+        for (let i = 0; i < targetParticleCount; i++) {
+            // 循环取图片
+            const urlIndex = i % imageUrls.length;
+            const imgUrl = imageUrls[urlIndex];
+
+            // 1. 生成压缩纹理
+            const imgData = await compressImage(imgUrl);
+            if (!imgData) continue;
+
+            loadedCount++;
+            if(loadedCount % 5 === 0) {
+                 statusDiv.innerText = `加载资源: ${loadedCount} / ${targetParticleCount}`;
+            }
+
+            // 2. 创建材质
+            const texture = new THREE.TextureLoader().load(imgData.src);
+            const material = new THREE.MeshBasicMaterial({ 
+                map: texture, 
+                side: THREE.DoubleSide,
+                transparent: true
+            });
+
+            // 3. 创建 Mesh (平面)
+            const geometry = new THREE.PlaneGeometry(15, 15 / imgData.aspect);
+            const mesh = new THREE.Mesh(geometry, material);
+
+            // 4. 计算“树”形态的坐标
+            const angle = i * angleStep;
+            const y = 200 - (i * heightStep); // 从上往下
+            const r = (200 - y) / 3 + 10; // 半径随高度变大
+            const x = r * Math.cos(angle);
+            const z = r * Math.sin(angle);
+
+            // 5. 计算“爆炸”形态的坐标 (随机)
+            const explodeX = (Math.random() - 0.5) * 800;
+            const explodeY = (Math.random() - 0.5) * 800;
+            const explodeZ = (Math.random() - 0.5) * 800;
+
+            // 存储数据
+            mesh.userData = {
+                treePos: { x, y, z },
+                treeRot: { x: 0, y: -angle, z: 0 },
+                explodePos: { x: explodeX, y: explodeY, z: explodeZ },
+                explodeRot: { x: Math.random() * Math.PI, y: Math.random() * Math.PI, z: Math.random() * Math.PI },
+                originalUrl: imgData.originalSrc, // 保存高清图链接
+                isViewing: false
+            };
+
+            // 初始位置设为树
+            mesh.position.set(x, y, z);
+            mesh.rotation.set(0, -angle, 0);
+
+            scene.add(mesh);
+            particles.push(mesh);
+        }
+
+        // 树顶星星
+        const starGeo = new THREE.OctahedronGeometry(10, 0);
+        const starMat = new THREE.MeshStandardMaterial({ color: 0xffd700, emissive: 0xffaa00 });
+        const star = new THREE.Mesh(starGeo, starMat);
+        star.position.set(0, 215, 0);
+        
+        // 星星动画数据
+        star.userData = { isStar: true };
+        scene.add(star);
+        particles.push(star); // 让星星也参与爆炸
+
+        statusDiv.innerText = "准备就绪！";
+        document.getElementById('start-btn').disabled = false;
+        document.getElementById('start-btn').innerText = "启动体验";
+    }
+
+    // ================= 动画控制 =================
+
+    function transformTo(shape) {
+        if (state === 'viewing') return; // 查看图片时锁定
+        
+        state = shape; // 'tree' or 'explode'
+
+        particles.forEach(obj => {
+            if (obj.userData.isViewing) return; // 不影响当前查看的图片
+
+            const targetPos = shape === 'tree' 
+                ? (obj.userData.treePos || {x:0, y:215, z:0}) 
+                : (obj.userData.explodePos || {x:0, y:1000, z:0});
+            
+            const targetRot = shape === 'tree'
+                ? (obj.userData.treeRot || {x:0, y:0, z:0})
+                : (obj.userData.explodeRot || {x:0, y:0, z:0});
+
+            // 位置动画
+            new TWEEN.Tween(obj.position)
+                .to(targetPos, 2000)
+                .easing(TWEEN.Easing.Exponential.InOut)
+                .start();
+
+            // 旋转动画
+            new TWEEN.Tween(obj.rotation)
+                .to(targetRot, 2000)
+                .easing(TWEEN.Easing.Cubic.InOut)
+                .start();
+        });
+    }
+
+    // 点击/触摸处理 (查看详情)
+    function handleInteraction(x, y) {
+        // 如果正在查看，点击任意处恢复
+        if (state === 'viewing' && currentViewObject) {
+            resetView(currentViewObject);
+            return;
+        }
+
+        // 归一化坐标
+        mouse.x = (x / window.innerWidth) * 2 - 1;
+        mouse.y = -(y / window.innerHeight) * 2 + 1;
+
+        raycaster.setFromCamera(mouse, camera);
+        const intersects = raycaster.intersectObjects(particles);
+
+        if (intersects.length > 0) {
+            const selected = intersects[0].object;
+            if (selected.userData.isStar) return; // 星星不放大
+            
+            zoomIn(selected);
+        }
+    }
+
+    function zoomIn(obj) {
+        state = 'viewing';
+        currentViewObject = obj;
+        obj.userData.isViewing = true;
+
+        // 1. 飞到摄像机前方
+        const targetPos = new THREE.Vector3(0, 0, -100); // 相对相机的位置
+        targetPos.applyMatrix4(camera.matrixWorld);
+
+        // 2. 面向相机
+        const targetRot = camera.rotation.clone();
+
+        new TWEEN.Tween(obj.position).to(targetPos, 1000).easing(TWEEN.Easing.Quintic.Out).start();
+        new TWEEN.Tween(obj.rotation).to({x: targetRot.x, y: targetRot.y, z: targetRot.z}, 1000).start();
+        new TWEEN.Tween(obj.scale).to({x: 5, y: 5, z: 5}, 1000).start(); // 放大
+
+        // 3. 此时加载高清原图
+        if (obj.userData.originalUrl) {
+            new THREE.TextureLoader().load(obj.userData.originalUrl, (hdTexture) => {
+                if (obj.userData.isViewing) { // 再次检查以防用户点太快
+                    obj.material.map = hdTexture;
+                    obj.material.needsUpdate = true;
+                }
+            });
+        }
+    }
+
+    function resetView(obj) {
+        state = 'tree'; // 或者是 explode，取决于上一个状态，这里简单处理回 tree
+        obj.userData.isViewing = false;
+        currentViewObject = null;
+        
+        // 恢复大小
+        new TWEEN.Tween(obj.scale).to({x: 1, y: 1, z: 1}, 800).start();
+        
+        // 恢复位置
+        const targetPos = obj.userData.treePos;
+        const targetRot = obj.userData.treeRot;
+        
+        new TWEEN.Tween(obj.position).to(targetPos, 1000).easing(TWEEN.Easing.Quadratic.Out).start();
+        new TWEEN.Tween(obj.rotation).to(targetRot, 1000).start();
+    }
+
+    function onMouseClick(event) {
+        handleInteraction(event.clientX, event.clientY);
+    }
+
+    function onTouchStart(event) {
+        if (event.touches.length > 0) {
+            handleInteraction(event.touches[0].clientX, event.touches[0].clientY);
+        }
+    }
+
+    function onWindowResize() {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    function animate() {
+        requestAnimationFrame(animate);
+        TWEEN.update();
+        
+        // 简单的自转，仅在树形态且没人查看图片时
+        if (state === 'tree' && !currentViewObject) {
+            scene.rotation.y += 0.001;
+        }
+
+        renderer.render(scene, camera);
+    }
+
+    // ================= MediaPipe 手势识别 =================
+    
+    const videoElement = document.getElementsByClassName('input_video')[0];
+    let isVideoRunning = false;
+    let lastGesture = 'none';
+
+    function onResults(results) {
+        if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) return;
+
+        // 获取第一只手
+        const landmarks = results.multiHandLandmarks[0];
+        
+        // 简单的手势逻辑
+        const wrist = landmarks[0];
+        const tip = landmarks[12];
+        const distance = Math.sqrt(Math.pow(tip.x - wrist.x, 2) + Math.pow(tip.y - wrist.y, 2));
+        
+        let gesture = 'none';
+        if (distance > 0.35) { 
+            gesture = 'open';
+        } else if (distance < 0.25) {
+            gesture = 'closed';
+        }
+
+        // 状态机
+        if (gesture !== lastGesture) {
+            if (gesture === 'open') {
+                transformTo('explode');
+            } else if (gesture === 'closed') {
+                transformTo('tree');
+            }
+            lastGesture = gesture;
+        }
+    }
+
+    const hands = new Hands({locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+    }});
+
+    hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+    });
+
+    hands.onResults(onResults);
+
+    // ================= 启动流程 =================
+    document.getElementById('start-btn').addEventListener('click', async () => {
+        document.getElementById('loading').style.display = 'none';
+        
+        // 0. 播放音乐 (必须在用户交互后调用)
+        const bgm = document.getElementById('bgm');
+        bgm.volume = 0.5; // 音量 50%
+        bgm.play().catch(e => console.log("Music play failed:", e));
+
+        // 1. 初始化 3D
+        await initThree();
+
+        // 2. 启动摄像头
+        const cameraUtils = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+            },
+            width: 640,
+            height: 480
+        });
+        
+        try {
+            await cameraUtils.start();
+        } catch(e) {
+            console.error("Camera error:", e);
+            alert("摄像头启动失败，请确保在 HTTPS 环境下。您仍可点击图片互动。");
+        }
+    });
+</script>
+</body>
+</html>
